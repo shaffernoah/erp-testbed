@@ -1,0 +1,14 @@
+sqlalchemy>=2.0
+faker>=24.0
+numpy>=1.26
+pandas>=2.2
+anthropic>=0.40
+openai>=1.50
+python-dotenv>=1.0
+pydantic>=2.9
+rich>=13.7
+tabulate>=0.9
+tqdm>=4.66
+pytest>=8.3
+jupyter>=1.1
+matplotlib>=3.9
