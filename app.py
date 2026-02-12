@@ -1,7 +1,7 @@
 """
-LaFrieda ERP Agent Chat Interface
+LaFrieda ERP Agent Dashboard
 
-Single-file Flask app with embedded HTML/JS chatbot UI.
+Flask app serving the ERP agent chat interface with KPI dashboard.
 Run: python app.py
 Open: http://localhost:5001
 """
@@ -12,17 +12,19 @@ import json
 import time
 import inspect
 import logging
-from functools import partial
+from datetime import date, timedelta
 
 from dotenv import load_dotenv
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'), override=True)
 
-from flask import Flask, request, Response, stream_with_context, send_from_directory
+from flask import Flask, request, Response, stream_with_context, send_from_directory, render_template, jsonify
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import anthropic
+from sqlalchemy import func, and_
 from database.connection import get_session
+from database.models import Inventory, Lot, Product, Route, Invoice
 from agents.tool_registry import Tool, ToolRegistry
 from agents.prompts.vendor_ops_agent import SYSTEM_PROMPT as OPS_PROMPT
 from agents.prompts.vendor_sales_agent import SYSTEM_PROMPT as SALES_PROMPT
@@ -36,6 +38,9 @@ from agents.tools.payment_optimizer import TOOL_DEF as po_def
 from agents.tools.reorder_suggestions import TOOL_DEF as rs_def
 from agents.tools.dispute_handler import TOOL_DEF as dh_def
 from agents.tools.inventory_optimizer import TOOL_DEF as io_def
+from agents.tools.slow_mover_scanner import TOOL_DEF as sms_def
+from agents.tools.route_optimizer import TOOL_DEF as ro_def
+from agents.tools.profit_opportunity_scanner import TOOL_DEF as pos_def
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -55,7 +60,7 @@ PERSONAS = {
 def build_registry():
     """Build tool registry with session-bound functions."""
     registry = ToolRegistry()
-    for td in [qd_def, at_def, cg_def, po_def, rs_def, dh_def, io_def]:
+    for td in [qd_def, at_def, cg_def, po_def, rs_def, dh_def, io_def, sms_def, ro_def, pos_def]:
         sig = inspect.signature(td.function)
         if 'session' in sig.parameters:
             def make_bound(fn):
@@ -170,7 +175,7 @@ def run_agent_streaming(user_message, persona_key, conversation_history):
 
 @app.route('/')
 def index():
-    return HTML_PAGE
+    return render_template('index.html')
 
 @app.route('/chat', methods=['POST'])
 def chat():
@@ -188,361 +193,147 @@ def chat():
         }
     )
 
+@app.route('/api/kpis', methods=['GET'])
+def get_kpis():
+    """Return real-time KPI data for dashboard cards."""
+    today = date.today()
+
+    try:
+        # --- Expiry Risk ---
+        expiry_cutoff = today + timedelta(days=7)
+        expiry_lots = (
+            session.query(Lot)
+            .filter(
+                Lot.status.in_(["AVAILABLE", "RESERVED"]),
+                Lot.expiration_date <= expiry_cutoff,
+                Lot.expiration_date >= today,
+                Lot.current_quantity_lbs > 0,
+            )
+            .all()
+        )
+        expiry_value = 0
+        for lot in expiry_lots:
+            product = session.query(Product).get(lot.sku_id)
+            if product and product.cost_per_lb:
+                expiry_value += float(lot.current_quantity_lbs or 0) * float(product.cost_per_lb)
+
+        expiry_count = len(expiry_lots)
+        expiry_status = "critical" if expiry_count > 15 else ("warning" if expiry_count > 5 else "ok")
+
+        # --- Slow Movers ---
+        slow_mover_q = (
+            session.query(
+                func.count(func.distinct(Inventory.sku_id)).label("sku_count"),
+                func.sum(Inventory.total_value).label("total_value"),
+            )
+            .filter(
+                Inventory.quantity_on_hand > 0,
+                Inventory.days_in_inventory >= 21,
+                Inventory.days_until_expiry > 7,
+            )
+            .first()
+        )
+        slow_count = int(slow_mover_q.sku_count or 0) if slow_mover_q else 0
+        slow_value = float(slow_mover_q.total_value or 0) if slow_mover_q else 0
+        slow_status = "warning" if slow_value > 10000 else "ok"
+
+        # --- Route Efficiency ---
+        lookback = today - timedelta(days=14)
+        routes = session.query(Route).filter(Route.is_active == True).all()
+        active_route_count = len(routes)
+
+        if routes:
+            utilizations = []
+            for route in routes:
+                actual = (
+                    session.query(func.count(Invoice.invoice_id))
+                    .filter(
+                        Invoice.route_id == route.route_id,
+                        Invoice.invoice_date >= lookback,
+                    )
+                    .scalar() or 0
+                )
+                delivery_days = 12
+                avg_daily = actual / delivery_days if delivery_days > 0 else 0
+                estimated = route.estimated_stops or 15
+                util = (avg_daily / estimated * 100) if estimated > 0 else 0
+                utilizations.append(util)
+            avg_util = round(sum(utilizations) / len(utilizations), 0) if utilizations else 0
+        else:
+            avg_util = 0
+
+        route_status = "ok" if avg_util >= 80 else ("warning" if avg_util >= 60 else "critical")
+
+        # --- Margin Opportunities ---
+        # Use Product.target_margin_pct to count high-margin active SKUs
+        high_margin_products = (
+            session.query(func.count(Product.sku_id))
+            .filter(
+                Product.is_active == True,
+                Product.target_margin_pct >= 0.35,
+            )
+            .scalar() or 0
+        )
+        avg_target_margin = (
+            session.query(func.avg(Product.target_margin_pct))
+            .filter(
+                Product.is_active == True,
+                Product.target_margin_pct >= 0.35,
+            )
+            .scalar() or 0
+        )
+        margin_count = int(high_margin_products)
+        avg_margin = round(float(avg_target_margin) * 100, 1)
+
+        # --- Recent Alerts (top 8 for sidebar) ---
+        recent_alerts = []
+        for lot in expiry_lots[:8]:
+            days_left = (lot.expiration_date - today).days
+            product = session.query(Product).get(lot.sku_id)
+            product_name = product.name if product else lot.sku_id
+            severity = "critical" if days_left <= 2 else ("warning" if days_left <= 4 else "info")
+            recent_alerts.append({
+                "severity": severity,
+                "title": f"Lot {lot.lot_number} expires in {days_left}d",
+                "detail": f"{product_name} | {lot.current_quantity_lbs:.0f} lbs",
+            })
+
+        return jsonify({
+            "expiry_risk": {
+                "count": expiry_count,
+                "value": round(expiry_value, 0),
+                "status": expiry_status,
+            },
+            "slow_movers": {
+                "count": slow_count,
+                "value": round(slow_value, 0),
+                "status": slow_status,
+            },
+            "route_efficiency": {
+                "avg_utilization": int(avg_util),
+                "active_routes": active_route_count,
+                "status": route_status,
+            },
+            "margin_opps": {
+                "count": margin_count,
+                "avg_margin": avg_margin,
+                "status": "info",
+            },
+            "recent_alerts": recent_alerts,
+        })
+    except Exception as e:
+        logging.exception("KPI endpoint error")
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route('/static/<path:filename>')
 def static_files(filename):
     return send_from_directory('static', filename)
 
 
-# --- HTML/JS/CSS (all inline) ---
-
-HTML_PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>LaFrieda ERP Agent</title>
-<style>
-  * { box-sizing: border-box; margin: 0; padding: 0; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-    background: #0f1117;
-    color: #e4e4e7;
-    height: 100vh;
-    display: flex;
-    flex-direction: column;
-  }
-  header {
-    background: #18181b;
-    border-bottom: 1px solid #27272a;
-    padding: 12px 20px;
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    flex-shrink: 0;
-  }
-  header h1 {
-    font-size: 16px;
-    font-weight: 600;
-    color: #fafafa;
-  }
-  header .subtitle {
-    font-size: 12px;
-    color: #71717a;
-  }
-  .persona-select {
-    margin-left: auto;
-    display: flex;
-    gap: 6px;
-  }
-  .persona-btn {
-    padding: 5px 12px;
-    border-radius: 6px;
-    border: 1px solid #3f3f46;
-    background: #27272a;
-    color: #a1a1aa;
-    font-size: 12px;
-    cursor: pointer;
-    transition: all 0.15s;
-  }
-  .persona-btn:hover { border-color: #52525b; color: #e4e4e7; }
-  .persona-btn.active {
-    background: #dc2626;
-    border-color: #dc2626;
-    color: white;
-  }
-  .header-right {
-    margin-left: auto;
-    display: flex;
-    flex-direction: column;
-    align-items: flex-end;
-    gap: 8px;
-  }
-  .header-controls {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-  }
-  .trace-toggle {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    font-size: 11px;
-    color: #71717a;
-    cursor: pointer;
-    user-select: none;
-  }
-  .trace-toggle input {
-    accent-color: #dc2626;
-    cursor: pointer;
-  }
-  .persona-desc {
-    background: #1a1a2e;
-    border: 1px solid #27272a;
-    border-radius: 8px;
-    padding: 10px 14px;
-    margin: 0 20px 0 20px;
-    font-size: 12px;
-    color: #a1a1aa;
-    line-height: 1.5;
-    flex-shrink: 0;
-  }
-  .persona-desc .desc-title {
-    color: #e4e4e7;
-    font-weight: 600;
-    font-size: 13px;
-    margin-bottom: 4px;
-  }
-  .persona-desc .desc-tools {
-    margin-top: 6px;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-  }
-  .persona-desc .tool-tag {
-    background: #27272a;
-    border: 1px solid #3f3f46;
-    padding: 2px 8px;
-    border-radius: 4px;
-    font-size: 11px;
-    color: #a78bfa;
-  }
-  #chat-container {
-    flex: 1;
-    overflow-y: auto;
-    padding: 20px;
-    display: flex;
-    flex-direction: column;
-    gap: 16px;
-  }
-  .message {
-    max-width: 85%;
-    padding: 12px 16px;
-    border-radius: 12px;
-    font-size: 14px;
-    line-height: 1.6;
-    white-space: pre-wrap;
-    word-wrap: break-word;
-  }
-  .message.user {
-    align-self: flex-end;
-    background: #dc2626;
-    color: white;
-    border-bottom-right-radius: 4px;
-  }
-  .message.assistant {
-    align-self: flex-start;
-    background: #27272a;
-    border: 1px solid #3f3f46;
-    border-bottom-left-radius: 4px;
-  }
-  .message.assistant .md-content h1,
-  .message.assistant .md-content h2,
-  .message.assistant .md-content h3 {
-    margin-top: 12px;
-    margin-bottom: 6px;
-    color: #fafafa;
-  }
-  .message.assistant .md-content h2 { font-size: 15px; }
-  .message.assistant .md-content h3 { font-size: 14px; }
-  .message.assistant .md-content ul,
-  .message.assistant .md-content ol {
-    padding-left: 20px;
-    margin: 4px 0;
-  }
-  .message.assistant .md-content strong { color: #fafafa; }
-  .message.assistant .md-content code {
-    background: #18181b;
-    padding: 1px 5px;
-    border-radius: 3px;
-    font-size: 13px;
-  }
-  .message.assistant .md-content table {
-    border-collapse: collapse;
-    margin: 8px 0;
-    font-size: 13px;
-    width: 100%;
-  }
-  .message.assistant .md-content th,
-  .message.assistant .md-content td {
-    border: 1px solid #3f3f46;
-    padding: 4px 8px;
-    text-align: left;
-  }
-  .message.assistant .md-content th { background: #18181b; }
-  .trace-block {
-    align-self: flex-start;
-    max-width: 85%;
-    font-size: 12px;
-    color: #71717a;
-    padding: 6px 12px;
-    background: #18181b;
-    border-radius: 8px;
-    border: 1px solid #27272a;
-    display: flex;
-    align-items: center;
-    gap: 8px;
-  }
-  .trace-block .icon { font-size: 14px; }
-  .trace-block .tool-name { color: #a78bfa; font-weight: 600; }
-  .trace-block .trace-text { color: #71717a; }
-  body.hide-trace .trace-block { display: none; }
-  .stats-bar {
-    font-size: 11px;
-    color: #52525b;
-    align-self: flex-start;
-    padding: 2px 0 0 4px;
-  }
-  #input-area {
-    background: #18181b;
-    border-top: 1px solid #27272a;
-    padding: 16px 20px;
-    display: flex;
-    gap: 10px;
-    flex-shrink: 0;
-  }
-  #msg-input {
-    flex: 1;
-    background: #27272a;
-    border: 1px solid #3f3f46;
-    border-radius: 10px;
-    padding: 10px 14px;
-    color: #fafafa;
-    font-size: 14px;
-    font-family: inherit;
-    resize: none;
-    outline: none;
-    min-height: 42px;
-    max-height: 120px;
-  }
-  #msg-input:focus { border-color: #dc2626; }
-  #msg-input::placeholder { color: #52525b; }
-  #send-btn {
-    background: #dc2626;
-    color: white;
-    border: none;
-    border-radius: 10px;
-    padding: 10px 20px;
-    font-size: 14px;
-    font-weight: 600;
-    cursor: pointer;
-    transition: background 0.15s;
-    align-self: flex-end;
-  }
-  #send-btn:hover { background: #b91c1c; }
-  #send-btn:disabled { background: #52525b; cursor: not-allowed; }
-  .typing-indicator {
-    align-self: flex-start;
-    display: flex;
-    gap: 4px;
-    padding: 12px 16px;
-  }
-  .typing-indicator span {
-    width: 8px; height: 8px;
-    background: #52525b;
-    border-radius: 50%;
-    animation: bounce 1.4s infinite ease-in-out both;
-  }
-  .typing-indicator span:nth-child(1) { animation-delay: -0.32s; }
-  .typing-indicator span:nth-child(2) { animation-delay: -0.16s; }
-  @keyframes bounce {
-    0%, 80%, 100% { transform: scale(0); }
-    40% { transform: scale(1); }
-  }
-  .welcome {
-    text-align: center;
-    padding: 60px 20px;
-    color: #52525b;
-  }
-  .welcome h2 { color: #a1a1aa; font-size: 20px; margin-bottom: 8px; }
-  .welcome p { font-size: 13px; max-width: 500px; margin: 0 auto 16px; line-height: 1.5; }
-  .welcome .examples {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    align-items: center;
-  }
-  .welcome .example-btn {
-    background: #27272a;
-    border: 1px solid #3f3f46;
-    color: #a1a1aa;
-    padding: 8px 16px;
-    border-radius: 8px;
-    font-size: 13px;
-    cursor: pointer;
-    transition: all 0.15s;
-    max-width: 500px;
-    width: 100%;
-    text-align: left;
-  }
-  .welcome .example-btn:hover {
-    border-color: #dc2626;
-    color: #e4e4e7;
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div>
-    <h1>Pat LaFrieda ERP Agent</h1>
-    <div class="subtitle">AI-powered operations & sales intelligence</div>
-  </div>
-  <div class="header-right">
-    <div class="persona-select">
-      <button class="persona-btn active" data-persona="vendor_ops">Operations</button>
-      <button class="persona-btn" data-persona="vendor_sales">Sales</button>
-      <button class="persona-btn" data-persona="restaurant">Restaurant</button>
-    </div>
-    <div class="header-controls">
-      <label class="trace-toggle">
-        <input type="checkbox" id="trace-toggle" checked> Show agent trace
-      </label>
-    </div>
-  </div>
-</header>
-
-<div class="persona-desc" id="persona-desc">
-  <div class="desc-title" id="desc-title">Vendor Operations Agent</div>
-  <div id="desc-text">Food safety, spoilage prevention, inventory optimization, replenishment planning, and operational alerting. Monitors lot expirations, temperature compliance, FIFO discipline, and warehouse zone transfers.</div>
-  <div class="desc-tools" id="desc-tools">
-    <span class="tool-tag">query_database</span>
-    <span class="tool-tag">check_alerts</span>
-    <span class="tool-tag">optimize_inventory</span>
-    <span class="tool-tag">get_reorder_suggestions</span>
-    <span class="tool-tag">generate_campaign</span>
-    <span class="tool-tag">handle_dispute</span>
-    <span class="tool-tag">optimize_payments</span>
-  </div>
-</div>
-
-<div id="chat-container">
-  <div class="welcome" id="welcome">
-    <h2>LaFrieda ERP Agent</h2>
-    <p>Ask questions about inventory, customers, sales, spoilage risk, campaigns, and more. The agent will query the database and use tools to answer.</p>
-    <div class="examples">
-      <button class="example-btn" onclick="askExample(this)">What inventory is at risk of expiring in the next 7 days?</button>
-      <button class="example-btn" onclick="askExample(this)">Which Cari-enrolled accounts show signs of churn? Build a win-back campaign.</button>
-      <button class="example-btn" onclick="askExample(this)">Give me a daily operational briefing with alerts and recommended actions.</button>
-      <button class="example-btn" onclick="askExample(this)">What are our top 10 customers by revenue and how is their payment health?</button>
-    </div>
-  </div>
-</div>
-
-<div id="input-area">
-  <textarea id="msg-input" placeholder="Ask the agent anything..." rows="1"></textarea>
-  <button id="send-btn" onclick="sendMessage()">Send</button>
-</div>
-
-<script src="/static/app.js"></script>
-
-</body>
-</html>
-"""
-
-
 if __name__ == '__main__':
     print("=" * 50)
-    print("  LaFrieda ERP Agent Chat")
+    print("  LaFrieda ERP Agent Dashboard")
     print(f"  Model: {model}")
     print(f"  Tools: {registry.tool_names}")
     print(f"  Open: http://localhost:5001")
