@@ -154,61 +154,39 @@ def _generate_margin_summaries(session, invoices, payments, customers) -> list[M
 
     Revenue comes from invoice line totals; COGS is estimated from
     product.cost_per_lb * volume in pounds.
+
+    Uses a single SQL aggregation query to avoid N+1 ORM lazy-loading.
     """
-    # Build product cost lookup: sku_id -> cost_per_lb
-    # We collect this from line items' associated products via the relationship.
-    # Since we may not have eager-loaded products we build a sku -> cost map
-    # from the line items themselves (each line_item has a .product relationship).
-    sku_cost_cache: dict[str, float] = {}
+    from sqlalchemy import text
 
-    # Aggregate: (month_start, customer_id, category) -> metrics
-    AggKey = tuple  # (date, str, str)
-    agg: dict[AggKey, dict] = defaultdict(lambda: {
-        "revenue": 0.0,
-        "cogs": 0.0,
-        "volume_lbs": 0.0,
-        "num_invoices": set(),
-    })
+    rows = session.execute(text("""
+        SELECT
+            i.customer_id,
+            li.category,
+            strftime('%Y-%m-01', i.invoice_date) AS period,
+            SUM(COALESCE(li.line_total, 0))      AS revenue,
+            SUM(COALESCE(p.cost_per_lb, 0)
+                * COALESCE(li.catch_weight_lbs, li.quantity, 0)) AS cogs,
+            SUM(COALESCE(li.catch_weight_lbs, li.quantity, 0))   AS volume_lbs,
+            COUNT(DISTINCT i.invoice_id)          AS num_invoices
+        FROM invoice_line_items li
+        JOIN invoices i  ON i.invoice_id = li.invoice_id
+        LEFT JOIN products p ON p.sku_id = li.sku_id
+        GROUP BY i.customer_id, li.category, period
+    """)).fetchall()
 
-    for inv in invoices:
-        if not hasattr(inv, "line_items"):
-            continue
-        inv_month = date(inv.invoice_date.year, inv.invoice_date.month, 1)
-
-        for li in inv.line_items:
-            category = li.category or "UNKNOWN"
-            key: AggKey = (inv_month, inv.customer_id, category)
-
-            revenue = li.line_total or 0.0
-            volume = li.catch_weight_lbs or li.quantity or 0.0
-
-            # Resolve COGS from product cost_per_lb
-            cost_per_lb = sku_cost_cache.get(li.sku_id)
-            if cost_per_lb is None and li.product is not None:
-                cost_per_lb = li.product.cost_per_lb or 0.0
-                sku_cost_cache[li.sku_id] = cost_per_lb
-            if cost_per_lb is None:
-                cost_per_lb = 0.0
-
-            cogs = cost_per_lb * volume
-
-            agg[key]["revenue"] += revenue
-            agg[key]["cogs"] += cogs
-            agg[key]["volume_lbs"] += volume
-            agg[key]["num_invoices"].add(inv.invoice_id)
-
-    # Convert aggregates to ORM objects
     summaries: list[MarginSummary] = []
-
-    for (period_date, customer_id, category), metrics in agg.items():
-        revenue = round(metrics["revenue"], 2)
-        cogs = round(metrics["cogs"], 2)
+    for row in rows:
+        customer_id, category, period_str, revenue, cogs, volume, num_inv = row
+        category = category or "UNKNOWN"
+        revenue = round(revenue or 0, 2)
+        cogs = round(cogs or 0, 2)
+        volume = round(volume or 0, 2)
         gross_margin = round(revenue - cogs, 2)
         gross_margin_pct = round(gross_margin / revenue, 4) if revenue > 0 else 0.0
-        volume = round(metrics["volume_lbs"], 2)
-        num_inv = len(metrics["num_invoices"])
         avg_price = round(revenue / volume, 2) if volume > 0 else 0.0
         avg_cost = round(cogs / volume, 2) if volume > 0 else 0.0
+        period_date = date.fromisoformat(period_str)
 
         summary = MarginSummary(
             summary_id=make_id("MS"),
