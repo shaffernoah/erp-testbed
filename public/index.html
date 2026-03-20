@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LaFrieda ERP Agent</title>
+<link rel="stylesheet" href="/css/dashboard.css">
+<link rel="stylesheet" href="/css/components.css">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css">
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+</head>
+<body>
+
+<!-- API KEY BANNER -->
+<div class="api-key-banner" id="api-key-banner">
+  <div class="api-key-inner">
+    <div class="api-key-info">
+      <span class="api-key-icon">&#128273;</span>
+      <div>
+        <strong>Enter your Anthropic API Key to get started</strong>
+        <span class="api-key-note">Your key is stored only in your browser session and never sent to our servers.</span>
+      </div>
+    </div>
+    <div class="api-key-form">
+      <input type="password" id="api-key-input" placeholder="sk-ant-..." autocomplete="off" spellcheck="false">
+      <button id="api-key-save" onclick="saveApiKey()">Connect</button>
+    </div>
+  </div>
+</div>
+
+<!-- CONNECTED INDICATOR (shown after key is saved) -->
+<div class="api-key-connected" id="api-key-connected" style="display:none;">
+  <span class="connected-dot"></span>
+  <span>API Key connected</span>
+  <button class="api-key-change" onclick="changeApiKey()">Change</button>
+</div>
+
+<!-- HEADER -->
+<header id="header">
+  <div class="header-brand">
+    <div class="brand-icon">LF</div>
+    <div>
+      <h1>Pat LaFrieda</h1>
+      <span class="header-subtitle">ERP Agent Intelligence</span>
+    </div>
+  </div>
+  <nav class="persona-tabs" id="persona-tabs">
+    <button class="persona-tab active" data-persona="vendor_ops">
+      <span class="tab-icon">&#9881;</span> Operations
+    </button>
+    <button class="persona-tab" data-persona="vendor_sales">
+      <span class="tab-icon">&#9733;</span> Sales
+    </button>
+    <button class="persona-tab" data-persona="restaurant">
+      <span class="tab-icon">&#9749;</span> Restaurant
+    </button>
+  </nav>
+  <div class="header-actions">
+    <label class="trace-toggle">
+      <input type="checkbox" id="trace-toggle" checked>
+      <span>Trace</span>
+    </label>
+    <button class="btn-icon" id="new-chat-btn" title="New Chat">
+      <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 1v14M1 8h14" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+    </button>
+  </div>
+</header>
+
+<div class="app-layout">
+
+  <!-- SIDEBAR -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-section">
+      <div class="persona-card" id="persona-card">
+        <div class="persona-card-title" id="persona-title">Operations Manager</div>
+        <div class="persona-card-desc" id="persona-desc">Identify value at risk, optimize inventory, routes, and margins through proactive micro-actions.</div>
+        <div class="persona-tools" id="persona-tools"></div>
+      </div>
+    </div>
+
+    <div class="sidebar-section">
+      <div class="sidebar-label">Quick Actions</div>
+      <div class="quick-actions" id="quick-actions"></div>
+    </div>
+
+    <div class="sidebar-section sidebar-alerts">
+      <div class="sidebar-label">Active Alerts <span class="alert-badge" id="alert-count">--</span></div>
+      <div class="alert-feed" id="alert-feed">
+        <div class="alert-feed-loading">Loading alerts...</div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <main class="main-content">
+    <!-- KPI CARDS -->
+    <div class="kpi-row" id="kpi-row">
+      <div class="kpi-card" data-kpi="expiry_risk" onclick="kpiClick('expiry')">
+        <div class="kpi-header">
+          <span class="kpi-icon kpi-critical">&#9888;</span>
+          <span class="kpi-title">Expiry Risk</span>
+        </div>
+        <div class="kpi-value" id="kpi-expiry-value">--</div>
+        <div class="kpi-sub" id="kpi-expiry-sub">Loading...</div>
+      </div>
+      <div class="kpi-card" data-kpi="slow_movers" onclick="kpiClick('slow_movers')">
+        <div class="kpi-header">
+          <span class="kpi-icon kpi-warning">&#9202;</span>
+          <span class="kpi-title">Slow Movers</span>
+        </div>
+        <div class="kpi-value" id="kpi-slow-value">--</div>
+        <div class="kpi-sub" id="kpi-slow-sub">Loading...</div>
+      </div>
+      <div class="kpi-card" data-kpi="route_efficiency" onclick="kpiClick('routes')">
+        <div class="kpi-header">
+          <span class="kpi-icon kpi-info">&#9654;</span>
+          <span class="kpi-title">Route Efficiency</span>
+        </div>
+        <div class="kpi-value" id="kpi-route-value">--</div>
+        <div class="kpi-sub" id="kpi-route-sub">Loading...</div>
+      </div>
+      <div class="kpi-card" data-kpi="margin_opps" onclick="kpiClick('margin')">
+        <div class="kpi-header">
+          <span class="kpi-icon kpi-success">&#9650;</span>
+          <span class="kpi-title">Margin Opps</span>
+        </div>
+        <div class="kpi-value" id="kpi-margin-value">--</div>
+        <div class="kpi-sub" id="kpi-margin-sub">Loading...</div>
+      </div>
+    </div>
+
+    <!-- CHAT AREA -->
+    <div class="chat-wrapper">
+      <div class="chat-container" id="chat-container">
+        <div class="welcome" id="welcome">
+          <div class="welcome-icon">LF</div>
+          <h2>LaFrieda ERP Agent</h2>
+          <p>AI-powered operations intelligence. Ask questions, get proactive recommendations with dollar-quantified impact.</p>
+          <div class="welcome-examples" id="welcome-examples"></div>
+        </div>
+      </div>
+
+      <!-- INPUT AREA -->
+      <div class="input-area">
+        <div class="input-wrapper">
+          <textarea id="msg-input" placeholder="Ask the agent anything..." rows="1"></textarea>
+          <button id="send-btn" onclick="sendMessage()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M22 2L11 13" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M22 2L15 22L11 13L2 9L22 2Z" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </button>
+        </div>
+      </div>
+    </div>
+  </main>
+</div>
+
+<script src="/js/app.js"></script>
+<script src="/js/dashboard.js"></script>
+</body>
+</html>
