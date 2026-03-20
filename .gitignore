@@ -1,8 +1,8 @@
 # Environment & secrets
 .env
 
-# Database (regenerated via `python -m database.seed`)
-data/lafrieda.db
+# Database - included for Vercel deployment with test data
+# Regenerate locally via: python -m database.seed
 
 # Python
 __pycache__/
