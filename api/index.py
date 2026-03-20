@@ -43,7 +43,8 @@ from agents.tools.profit_opportunity_scanner import TOOL_DEF as pos_def
 
 logging.basicConfig(level=logging.WARNING)
 
-app = Flask(__name__)
+PUBLIC_DIR = PROJECT_ROOT / "public"
+app = Flask(__name__, static_folder=str(PUBLIC_DIR), static_url_path='')
 
 # --- Setup (shared across requests in warm container) ---
 session = get_session()
@@ -327,3 +328,10 @@ def get_kpis():
     except Exception as e:
         logging.exception("KPI endpoint error")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route('/')
+def serve_index():
+    """Serve the frontend index.html."""
+    from flask import send_from_directory
+    return send_from_directory(str(PUBLIC_DIR), 'index.html')
